@@ -1,0 +1,26 @@
+@"
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+.env
+
+# Node / React
+node_modules/
+dist/
+build/
+
+# Models
+*.h5
+*.tflite
+*.pt
+
+# OS/Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Misc
+*.log
+"@ | Out-File -Encoding utf8 .gitignore
