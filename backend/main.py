@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BACKEND_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, os.path.join(_ROOT, "risk-logic"))
 
@@ -26,7 +27,14 @@ from advisory_data import get_advisory
 # DATABASE
 # ============================================================
 
-conn = sqlite3.connect("reports.db", check_same_thread=False)
+# FIX: anchor the db file to this script's own folder, not the process's
+# current working directory. A bare relative path like "reports.db" means
+# every time the server is launched from a different cwd (a different
+# terminal, a different IDE run button, a different deploy script) you get
+# a brand-new empty database — which looks exactly like "data disappearing".
+DB_PATH = _BACKEND_DIR / "reports.db"
+
+conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -43,16 +51,18 @@ CREATE TABLE IF NOT EXISTS reports (
     status TEXT,
     confirmed_disease TEXT,
     officer_id TEXT,
-    timestamp TEXT
+    timestamp TEXT,
+    farmer_id TEXT
 )
 """)
 
-# Add timestamp column if using an older database
-try:
-    cursor.execute("ALTER TABLE reports ADD COLUMN timestamp TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
+# Add columns if using an older database (safe no-op if already present)
+for _col_def in ("timestamp TEXT", "farmer_id TEXT"):
+    try:
+        cursor.execute(f"ALTER TABLE reports ADD COLUMN {_col_def}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 conn.commit()
 
@@ -63,7 +73,7 @@ conn.commit()
 
 app = FastAPI(title="SIH Agri Disease Detection API")
 
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR = _BACKEND_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -116,7 +126,8 @@ def run_prediction(image_data):
 @app.get("/")
 def home():
     return {
-        "message": "SIH Backend is running"
+        "message": "SIH Backend is running",
+        "db_path": str(DB_PATH),  # handy for debugging "which db am I using"
     }
 
 
@@ -131,10 +142,19 @@ def upload_report(
     village: str = Form(...),
     lat: float = Form(...),
     lng: float = Form(...),
-    image_file: UploadFile = File(...)
+    image_file: UploadFile = File(...),
+    farmer_id: str = Form(None),  # optional for now, so old clients don't break
 ):
     report_id = str(uuid.uuid4())
     timestamp = datetime.now().isoformat()
+
+    # If the frontend doesn't send one yet (no login system), fall back to
+    # a generated id so at least this upload has *something* to key on.
+    # Once the frontend starts sending a real farmer_id (phone number or a
+    # locally-stored device id), that will be used and reports will start
+    # being retrievable across sessions.
+    if not farmer_id:
+        farmer_id = "unknown"
 
     image_data = image_file.file.read()
 
@@ -169,7 +189,8 @@ def upload_report(
             "lng": lng
         },
         "timestamp": timestamp,
-        "advisory": advisory
+        "advisory": advisory,
+        "farmer_id": farmer_id,
     }
 
     cursor.execute("""
@@ -184,9 +205,10 @@ def upload_report(
             disease,
             confidence,
             status,
-            timestamp
+            timestamp,
+            farmer_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         report_id,
         image_file.filename,
@@ -198,12 +220,55 @@ def upload_report(
         disease,
         confidence,
         status,
-        timestamp
+        timestamp,
+        farmer_id,
     ))
 
     conn.commit()
 
     return report
+
+
+# ============================================================
+# FARMER: LIST OWN REPORTS  (NEW)
+# ============================================================
+
+@app.get("/my-reports/{farmer_id}")
+def my_reports(farmer_id: str):
+    """
+    Lets a farmer retrieve their own report history across sessions.
+    Requires the frontend to send the same farmer_id at upload time and
+    at login/refresh time — see the note in upload_report() above.
+    """
+    cursor.execute(
+        "SELECT * FROM reports WHERE farmer_id = ? ORDER BY timestamp DESC",
+        (farmer_id,)
+    )
+
+    rows = cursor.fetchall()
+    reports = []
+
+    for row in rows:
+        reports.append({
+            "report_id": row[0],
+            "filename": row[1],
+            "crop": row[2],
+            "stage": row[3],
+            "location": {
+                "village": row[4],
+                "lat": row[5],
+                "lng": row[6]
+            },
+            "disease": row[7],
+            "confidence": row[8],
+            "status": row[9],
+            "confirmed_disease": row[10],
+            "officer_id": row[11],
+            "timestamp": row[12],
+            "farmer_id": row[13],
+        })
+
+    return reports
 
 
 # ============================================================
