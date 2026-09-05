@@ -1,10 +1,30 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
-from risk_logic import determine_risk, should_send_advisory
-from prediction import predict
-from datetime import datetime
+import os
+import sys
 import sqlite3
 import uuid
+from datetime import datetime
+from pathlib import Path
 
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+sys.path.insert(0, os.path.join(_ROOT, "risk-logic"))
+
+from risk_logic import determine_risk, should_send_advisory
+from advisory_data import get_advisory
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 conn = sqlite3.connect("reports.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -19,7 +39,7 @@ CREATE TABLE IF NOT EXISTS reports (
     lat REAL,
     lng REAL,
     disease TEXT,
-    confidence INTEGER,
+    confidence REAL,
     status TEXT,
     confirmed_disease TEXT,
     officer_id TEXT,
@@ -36,25 +56,73 @@ except sqlite3.OperationalError:
 
 conn.commit()
 
-app = FastAPI()
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
+app = FastAPI(title="SIH Agri Disease Detection API")
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
-advisories = {
-    "Leaf Blight": {
-        "what_it_is": "A fungal disease affecting crop leaves.",
-        "what_to_do": [
-            "Remove severely affected leaves.",
-            "Avoid excessive moisture on leaves."
-        ],
-        "safe_dosage": "Follow the fungicide label dosage."
-    }
-}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+
+# ============================================================
+# ML PREDICTION
+# ============================================================
+
+def run_prediction(image_data):
+    """
+    Load the ML model only when prediction is actually required.
+
+    This allows the FastAPI backend to start on systems where
+    TensorFlow/NumPy are not installed.
+    """
+
+    ml_dir = Path(_ROOT) / "ml-model"
+
+    if str(ml_dir) not in sys.path:
+        sys.path.insert(0, str(ml_dir))
+
+    try:
+        from predict import predict
+        return predict(image_data)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {exc}"
+        )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 def home():
-    return {"message": "SIH Backend is running"}
+    return {
+        "message": "SIH Backend is running"
+    }
 
+
+# ============================================================
+# UPLOAD REPORT
+# ============================================================
 
 @app.post("/upload-report")
 def upload_report(
@@ -70,25 +138,28 @@ def upload_report(
 
     image_data = image_file.file.read()
 
-    result = predict(image_data)
+    image_path = UPLOAD_DIR / f"{report_id}_{image_file.filename}"
+    image_path.write_bytes(image_data)
+
+    # Run real ML prediction
+    result = run_prediction(image_data)
 
     disease = result["disease"]
     confidence = result["confidence"]
 
+    # Determine confidence-based workflow
     status = determine_risk(confidence)
     send_advisory = should_send_advisory(confidence)
 
-    if send_advisory:
-        advisory = advisories.get(disease)
-    else:
-        advisory = None
+    # Generate advisory only when confidence threshold allows it
+    advisory = get_advisory(disease) if send_advisory else None
 
     report = {
         "report_id": report_id,
         "filename": image_file.filename,
         "crop": crop,
         "stage": stage,
-        "image_url": image_file.filename,
+        "image_url": f"/uploads/{report_id}_{image_file.filename}",
         "disease": disease,
         "confidence": confidence,
         "status": status,
@@ -135,8 +206,13 @@ def upload_report(
     return report
 
 
+# ============================================================
+# ADVISORY
+# ============================================================
+
 @app.get("/advisory/{report_id}")
-def get_advisory(report_id: str):
+def get_advisory_for_report(report_id: str):
+
     cursor.execute(
         "SELECT * FROM reports WHERE report_id = ?",
         (report_id,)
@@ -145,27 +221,32 @@ def get_advisory(report_id: str):
     row = cursor.fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail="Report not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found"
+        )
 
     disease = row[7]
 
-    if disease not in advisories:
-        raise HTTPException(
-            status_code=404,
-            detail="Advisory not available"
-        )
+    advisory = get_advisory(disease)
 
-    return advisories[disease]
+    return advisory
 
+
+# ============================================================
+# OFFICER QUEUE
+# ============================================================
 
 @app.get("/officer-queue")
 def officer_queue():
+
     cursor.execute(
         "SELECT * FROM reports WHERE status = ?",
         ("pending_review",)
     )
 
     rows = cursor.fetchall()
+
     queue = []
 
     for row in rows:
@@ -187,8 +268,13 @@ def officer_queue():
     return queue
 
 
+# ============================================================
+# CONFIRM CASE
+# ============================================================
+
 @app.post("/confirm-case")
 def confirm_case(data: dict):
+
     report_id = data["report_id"]
 
     cursor.execute(
@@ -199,7 +285,10 @@ def confirm_case(data: dict):
     row = cursor.fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail="Report not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found"
+        )
 
     cursor.execute("""
         UPDATE reports
@@ -242,14 +331,20 @@ def confirm_case(data: dict):
     }
 
 
+# ============================================================
+# CONFIRMED CASES
+# ============================================================
+
 @app.get("/confirmed-cases")
 def confirmed_cases():
+
     cursor.execute(
         "SELECT * FROM reports WHERE status = ?",
         ("confirmed",)
     )
 
     rows = cursor.fetchall()
+
     confirmed = []
 
     for row in rows:
