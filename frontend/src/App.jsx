@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
+  uploadReport as apiUploadReport,
+  fetchOfficerQueue,
+  confirmCase,
+  getAdvisory,
+  fetchConfirmedCases,
+} from "./api";
+import {
   Upload,
   Camera,
   Leaf,
