@@ -1,0 +1,11 @@
+
+# Python
+__pycache__/
+*.pyc
+
+# Local database
+backend/reports.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
