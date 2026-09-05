@@ -1,15 +1,43 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
-from risk_logic import determine_risk, should_send_advisory
-from prediction import predict
-from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone
 import sqlite3
 import uuid
+import os
+import sys
 
 
-conn = sqlite3.connect("reports.db", check_same_thread=False)
-cursor = conn.cursor()
+app = FastAPI(title="Agri Disease Detection API")
 
-cursor.execute("""
+
+# ==================================================
+# CORS
+# ==================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==================================================
+# DATABASE
+# ==================================================
+
+DB_NAME = "reports.db"
+
+db = sqlite3.connect(
+    DB_NAME,
+    check_same_thread=False
+)
+
+db.execute("""
 CREATE TABLE IF NOT EXISTS reports (
     report_id TEXT PRIMARY KEY,
     filename TEXT,
@@ -19,7 +47,7 @@ CREATE TABLE IF NOT EXISTS reports (
     lat REAL,
     lng REAL,
     disease TEXT,
-    confidence INTEGER,
+    confidence REAL,
     status TEXT,
     confirmed_disease TEXT,
     officer_id TEXT,
@@ -27,37 +55,195 @@ CREATE TABLE IF NOT EXISTS reports (
 )
 """)
 
-# Add timestamp column if using an older database
 try:
-    cursor.execute("ALTER TABLE reports ADD COLUMN timestamp TEXT")
-    conn.commit()
+    db.execute(
+        "ALTER TABLE reports ADD COLUMN timestamp TEXT"
+    )
+    db.commit()
 except sqlite3.OperationalError:
     pass
 
-conn.commit()
 
-app = FastAPI()
-
+# ==================================================
+# ADVISORIES
+# ==================================================
 
 advisories = {
-    "Leaf Blight": {
-        "what_it_is": "A fungal disease affecting crop leaves.",
+
+    "Bacterial_Spot": {
+        "what_it_is":
+            "Bacterial spot is a bacterial disease that causes dark spots and lesions on leaves.",
+
         "what_to_do": [
             "Remove severely affected leaves.",
-            "Avoid excessive moisture on leaves."
+            "Avoid overhead irrigation.",
+            "Keep the field and foliage dry where possible.",
+            "Use only locally recommended bactericides or treatments."
         ],
-        "safe_dosage": "Follow the fungicide label dosage."
+
+        "safe_dosage":
+            "Follow the product label and local agricultural officer recommendations."
+    },
+
+
+    "Early_Blight": {
+        "what_it_is":
+            "Early blight is a fungal disease that produces dark concentric lesions on leaves.",
+
+        "what_to_do": [
+            "Remove heavily infected leaves.",
+            "Avoid prolonged leaf wetness.",
+            "Maintain adequate spacing and field ventilation.",
+            "Use a locally recommended fungicide when necessary."
+        ],
+
+        "safe_dosage":
+            "Follow the fungicide label and local agricultural officer recommendations."
+    },
+
+
+    "Late_Blight": {
+        "what_it_is":
+            "Late blight is a serious disease that can rapidly damage leaves and stems under favourable conditions.",
+
+        "what_to_do": [
+            "Remove severely infected plant material.",
+            "Avoid overhead irrigation.",
+            "Improve field ventilation.",
+            "Seek agricultural guidance for appropriate fungicide treatment."
+        ],
+
+        "safe_dosage":
+            "Follow the fungicide label and local agricultural officer recommendations."
+    },
+
+
+    "Leaf_Mold": {
+        "what_it_is":
+            "Leaf mold is a fungal disease associated with leaf spots and mold growth, especially under humid conditions.",
+
+        "what_to_do": [
+            "Improve air circulation around plants.",
+            "Avoid excessive humidity and prolonged leaf wetness.",
+            "Remove severely affected leaves.",
+            "Use locally recommended fungicide treatment if required."
+        ],
+
+        "safe_dosage":
+            "Follow the fungicide label and local agricultural officer recommendations."
+    },
+
+
+    "Healthy": {
+        "what_it_is":
+            "The AI model classified the submitted leaf as healthy.",
+
+        "what_to_do": [
+            "Continue regular crop monitoring.",
+            "Maintain appropriate irrigation.",
+            "Monitor nearby plants for early symptoms."
+        ],
+
+        "safe_dosage":
+            "No disease treatment is indicated from this prediction."
     }
 }
 
 
-@app.get("/")
-def home():
-    return {"message": "SIH Backend is running"}
+# ==================================================
+# ML MODEL
+# ==================================================
 
+def run_prediction(image_data):
+    """
+    Loads the real ML predictor only when an image is submitted.
+
+    This keeps FastAPI importable on systems that do not currently
+    have TensorFlow installed.
+
+    The demo laptop must have the ML dependencies installed.
+    """
+
+    ml_model_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "ml-model"
+        )
+    )
+
+    if ml_model_path not in sys.path:
+        sys.path.append(ml_model_path)
+
+    try:
+        from predict import predict
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "ML model dependencies are not available. "
+                f"Model import failed: {str(e)}"
+            )
+        )
+
+    try:
+        return predict(image_data)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model prediction failed: {str(e)}"
+        )
+
+
+# ==================================================
+# DATABASE HELPER
+# ==================================================
+
+def row_to_report(row):
+
+    (
+        report_id,
+        filename,
+        crop,
+        stage,
+        village,
+        lat,
+        lng,
+        disease,
+        confidence,
+        status,
+        confirmed_disease,
+        officer_id,
+        timestamp
+    ) = row
+
+    return {
+        "report_id": report_id,
+        "crop": crop,
+        "stage": stage,
+        "image_url": filename,
+        "disease": disease,
+        "confidence": confidence,
+        "status": status,
+        "location": {
+            "village": village,
+            "lat": lat,
+            "lng": lng
+        },
+        "timestamp": timestamp,
+        "advisory": advisories.get(disease),
+        "confirmed_disease": confirmed_disease,
+        "officer_id": officer_id
+    }
+
+
+# ==================================================
+# UPLOAD REPORT
+# ==================================================
 
 @app.post("/upload-report")
-def upload_report(
+async def upload_report(
     crop: str = Form(...),
     stage: str = Form(...),
     village: str = Form(...),
@@ -65,27 +251,94 @@ def upload_report(
     lng: float = Form(...),
     image_file: UploadFile = File(...)
 ):
+
+    if (
+        not image_file.content_type
+        or not image_file.content_type.startswith("image/")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only image files are allowed."
+        )
+
+    image_data = await image_file.read()
+
+    if not image_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded image is empty."
+        )
+
     report_id = str(uuid.uuid4())
-    timestamp = datetime.now().isoformat()
 
-    image_data = image_file.file.read()
+    timestamp = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-    result = predict(image_data)
+    # ----------------------------------------------
+    # REAL AI PREDICTION
+    # ----------------------------------------------
 
-    disease = result["disease"]
-    confidence = result["confidence"]
+    prediction = run_prediction(image_data)
 
-    status = determine_risk(confidence)
-    send_advisory = should_send_advisory(confidence)
+    disease = prediction["disease"]
+    confidence = float(
+        prediction["confidence"]
+    )
 
-    if send_advisory:
-        advisory = advisories.get(disease)
+    # ----------------------------------------------
+    # RISK LOGIC
+    # ----------------------------------------------
+
+    if confidence > 80:
+        status = "auto_sent"
     else:
-        advisory = None
+        status = "pending_review"
 
-    report = {
+    # ----------------------------------------------
+    # DATABASE
+    # ----------------------------------------------
+
+    db.execute(
+        """
+        INSERT INTO reports (
+            report_id,
+            filename,
+            crop,
+            stage,
+            village,
+            lat,
+            lng,
+            disease,
+            confidence,
+            status,
+            confirmed_disease,
+            officer_id,
+            timestamp
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            report_id,
+            image_file.filename,
+            crop,
+            stage,
+            village,
+            lat,
+            lng,
+            disease,
+            confidence,
+            status,
+            None,
+            None,
+            timestamp
+        )
+    )
+
+    db.commit()
+
+    return {
         "report_id": report_id,
-        "filename": image_file.filename,
         "crop": crop,
         "stage": stage,
         "image_url": image_file.filename,
@@ -98,11 +351,20 @@ def upload_report(
             "lng": lng
         },
         "timestamp": timestamp,
-        "advisory": advisory
+        "advisory": advisories.get(disease)
     }
 
-    cursor.execute("""
-        INSERT INTO reports (
+
+# ==================================================
+# ADVISORY
+# ==================================================
+
+@app.get("/advisory/{report_id}")
+def get_advisory(report_id: str):
+
+    cursor = db.execute(
+        """
+        SELECT
             report_id,
             filename,
             crop,
@@ -113,162 +375,185 @@ def upload_report(
             disease,
             confidence,
             status,
+            confirmed_disease,
+            officer_id,
             timestamp
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        report_id,
-        image_file.filename,
-        crop,
-        stage,
-        village,
-        lat,
-        lng,
-        disease,
-        confidence,
-        status,
-        timestamp
-    ))
-
-    conn.commit()
-
-    return report
-
-
-@app.get("/advisory/{report_id}")
-def get_advisory(report_id: str):
-    cursor.execute(
-        "SELECT * FROM reports WHERE report_id = ?",
+        FROM reports
+        WHERE report_id = ?
+        """,
         (report_id,)
     )
 
     row = cursor.fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    disease = row[7]
-
-    if disease not in advisories:
         raise HTTPException(
             status_code=404,
-            detail="Advisory not available"
+            detail="Report not found."
         )
 
-    return advisories[disease]
+    report = row_to_report(row)
 
+    if report["advisory"] is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Advisory not available."
+        )
+
+    return report["advisory"]
+
+
+# ==================================================
+# OFFICER QUEUE
+# ==================================================
 
 @app.get("/officer-queue")
 def officer_queue():
-    cursor.execute(
-        "SELECT * FROM reports WHERE status = ?",
-        ("pending_review",)
+
+    cursor = db.execute(
+        """
+        SELECT
+            report_id,
+            filename,
+            crop,
+            stage,
+            village,
+            lat,
+            lng,
+            disease,
+            confidence,
+            status,
+            confirmed_disease,
+            officer_id,
+            timestamp
+        FROM reports
+        WHERE status = 'pending_review'
+        ORDER BY timestamp DESC
+        """
     )
 
     rows = cursor.fetchall()
-    queue = []
 
-    for row in rows:
-        queue.append({
-            "report_id": row[0],
-            "filename": row[1],
-            "crop": row[2],
-            "stage": row[3],
-            "location": {
-                "village": row[4],
-                "lat": row[5],
-                "lng": row[6]
-            },
-            "disease": row[7],
-            "confidence": row[8],
-            "status": row[9]
-        })
+    return [
+        row_to_report(row)
+        for row in rows
+    ]
 
-    return queue
 
+# ==================================================
+# CONFIRM / CORRECT CASE
+# ==================================================
 
 @app.post("/confirm-case")
 def confirm_case(data: dict):
-    report_id = data["report_id"]
 
-    cursor.execute(
-        "SELECT * FROM reports WHERE report_id = ?",
+    report_id = data.get("report_id")
+    confirmed_disease = data.get(
+        "confirmed_disease"
+    )
+    officer_id = data.get(
+        "officer_id",
+        "OFF-001"
+    )
+
+    if not report_id:
+        raise HTTPException(
+            status_code=400,
+            detail="report_id is required."
+        )
+
+    if not confirmed_disease:
+        raise HTTPException(
+            status_code=400,
+            detail="confirmed_disease is required."
+        )
+
+    cursor = db.execute(
+        """
+        SELECT report_id
+        FROM reports
+        WHERE report_id = ?
+        """,
         (report_id,)
     )
 
-    row = cursor.fetchone()
+    if cursor.fetchone() is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found."
+        )
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    cursor.execute("""
+    db.execute(
+        """
         UPDATE reports
-        SET status = ?,
+        SET
+            status = 'confirmed',
             confirmed_disease = ?,
             officer_id = ?
         WHERE report_id = ?
-    """, (
-        "confirmed",
-        data["confirmed_disease"],
-        data["officer_id"],
-        report_id
-    ))
-
-    conn.commit()
-
-    cursor.execute(
-        "SELECT * FROM reports WHERE report_id = ?",
-        (report_id,)
+        """,
+        (
+            confirmed_disease,
+            officer_id,
+            report_id
+        )
     )
 
-    row = cursor.fetchone()
+    db.commit()
 
     return {
-        "report_id": row[0],
-        "filename": row[1],
-        "crop": row[2],
-        "stage": row[3],
-        "location": {
-            "village": row[4],
-            "lat": row[5],
-            "lng": row[6]
-        },
-        "disease": row[7],
-        "confidence": row[8],
-        "status": row[9],
-        "confirmed_disease": row[10],
-        "officer_id": row[11],
-        "timestamp": row[12]
+        "message": "Case confirmed successfully.",
+        "report_id": report_id,
+        "confirmed_disease": confirmed_disease,
+        "officer_id": officer_id,
+        "status": "confirmed"
     }
 
 
+# ==================================================
+# CONFIRMED CASES
+# ==================================================
+
 @app.get("/confirmed-cases")
 def confirmed_cases():
-    cursor.execute(
-        "SELECT * FROM reports WHERE status = ?",
-        ("confirmed",)
+
+    cursor = db.execute(
+        """
+        SELECT
+            report_id,
+            filename,
+            crop,
+            stage,
+            village,
+            lat,
+            lng,
+            disease,
+            confidence,
+            status,
+            confirmed_disease,
+            officer_id,
+            timestamp
+        FROM reports
+        WHERE status = 'confirmed'
+        ORDER BY timestamp DESC
+        """
     )
 
     rows = cursor.fetchall()
-    confirmed = []
 
-    for row in rows:
-        confirmed.append({
-            "report_id": row[0],
-            "filename": row[1],
-            "crop": row[2],
-            "stage": row[3],
-            "location": {
-                "village": row[4],
-                "lat": row[5],
-                "lng": row[6]
-            },
-            "disease": row[7],
-            "confidence": row[8],
-            "status": row[9],
-            "confirmed_disease": row[10],
-            "officer_id": row[11],
-            "timestamp": row[12]
-        })
+    return [
+        row_to_report(row)
+        for row in rows
+    ]
 
-    return confirmed
+
+# ==================================================
+# HEALTH CHECK
+# ==================================================
+
+@app.get("/")
+def root():
+    return {
+        "message":
+            "Agri Disease Detection API is running."
+    }
