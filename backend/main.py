@@ -97,12 +97,8 @@ app.add_middleware(
 
 def run_prediction(image_data):
     """
-    Load the ML model only when prediction is actually required.
-
-    This allows the FastAPI backend to start on systems where
-    TensorFlow/NumPy are not installed.
+    Load the ML prediction function and run prediction on uploaded image bytes.
     """
-
     ml_dir = Path(_ROOT) / "ml-model"
 
     if str(ml_dir) not in sys.path:
@@ -113,6 +109,7 @@ def run_prediction(image_data):
         return predict(image_data)
 
     except Exception as exc:
+        print("PREDICTION ERROR:", repr(exc))
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {exc}"

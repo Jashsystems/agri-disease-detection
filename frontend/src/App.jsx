@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   uploadReport as apiUploadReport,
+  fetchMyReports,
   fetchOfficerQueue,
   confirmCase,
   getAdvisory,
-  fetchConfirmedCases,
+  fetchConfirmedCases
 } from "./api";
 import {
   Upload,
@@ -60,13 +61,6 @@ import {
 import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import {
-  uploadReport as apiUploadReport,
-  fetchOfficerQueue,
-  confirmCase,
-  getAdvisory,
-  fetchConfirmedCases,
-} from "./api";
 
 /* =========================================================================
    API DATA LAYER
@@ -770,7 +764,7 @@ function FarmerHome({ lang, setLang, reports, onNewDiagnosis, onOpenReport }) {
   );
 }
 
-function FarmerUpload({ lang, setLang, onSubmitted, onBack }) {
+function FarmerUpload({ lang, setLang, farmerId, onSubmitted, onBack }) {
   const t = STRINGS[lang];
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
@@ -814,16 +808,18 @@ function FarmerUpload({ lang, setLang, onSubmitted, onBack }) {
     setError("");
 
     try {
-      const report = await apiUploadReport({
-        crop,
-        stage,
-        village,
-        imageFile,
-      });
-
+  const report = await apiUploadReport({
+    crop,
+    stage,
+    village,
+    imageFile,
+    farmerId,
+  });
       let enrichedReport = {
         ...report,
-        image_url: imagePreview,
+        image_url: report.image_url
+  ? `http://127.0.0.1:8000${report.image_url}`
+  : imagePreview,
         disease: formatDiseaseName(report.disease),
       };
 
@@ -1589,6 +1585,119 @@ function OfficerDashboard({ reports, onBack, user, onLogout }) {
   );
 }
 
+function OfficerLogin({ onBack, onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+
+    if (username === "officer" && password === "officer123") {
+      setError("");
+      onLogin();
+    } else {
+      setError("Invalid officer username or password.");
+    }
+  };
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
+      }}
+    >
+      <div
+        style={{
+          width: "100%",
+          maxWidth: "420px",
+          padding: "32px",
+          borderRadius: "20px",
+          background: "#fff",
+          boxShadow: "0 10px 40px rgba(0,0,0,0.08)",
+        }}
+      >
+        <h2>Officer Login</h2>
+
+        <p>
+          Authorized agricultural officers only.
+        </p>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: "16px" }}>
+            <label>Username</label>
+
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="Enter username"
+              required
+              style={{
+                width: "100%",
+                padding: "12px",
+                marginTop: "6px",
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          <div style={{ marginBottom: "16px" }}>
+            <label>Password</label>
+
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter password"
+              required
+              style={{
+                width: "100%",
+                padding: "12px",
+                marginTop: "6px",
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          {error && (
+            <p style={{ color: "red" }}>
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            style={{
+              width: "100%",
+              padding: "12px",
+              cursor: "pointer",
+            }}
+          >
+            Login
+          </button>
+
+          <button
+            type="button"
+            onClick={onBack}
+            style={{
+              width: "100%",
+              padding: "12px",
+              marginTop: "10px",
+              cursor: "pointer",
+            }}
+          >
+            Back
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
 /* =========================================================================
    ROOT APP
    ========================================================================= */
@@ -1602,6 +1711,21 @@ export default function App() {
   const [resultReadOnly, setResultReadOnly] = useState(false);
   const [mode, setMode] = useState(null);
 
+  const FARMER_ID_KEY = "agri_farmer_id";
+
+function getFarmerId() {
+  let farmerId = localStorage.getItem(FARMER_ID_KEY);
+
+  if (!farmerId) {
+    farmerId = crypto.randomUUID();
+    localStorage.setItem(FARMER_ID_KEY, farmerId);
+  }
+
+  return farmerId;
+}
+
+const farmerId = getFarmerId();
+
   const loadOfficerQueue = useCallback(async () => {
     setLoadingReports(true);
     try {
@@ -1614,6 +1738,20 @@ export default function App() {
       setLoadingReports(false);
     }
   }, []);
+
+  const loadMyReports = useCallback(async () => {
+  setLoadingReports(true);
+
+  try {
+    const data = await fetchMyReports(farmerId);
+    setReports(data);
+  } catch (err) {
+    console.error("Failed to load farmer reports:", err);
+    setReports([]);
+  } finally {
+    setLoadingReports(false);
+  }
+}, [farmerId]);
 
   const loadConfirmedCases = useCallback(async () => {
     try {
@@ -1629,11 +1767,13 @@ export default function App() {
     setView("landing");
   };
 
-  const handleFarmer = () => {
-    setMode("farmer");
-    setReports([]);
-    setView("farmerHome");
-  };
+  const handleFarmer = async () => {
+  setMode("farmer");
+  await loadMyReports();
+  setView("farmerHome");
+};
+
+
 
   const handleOfficer = async () => {
     setMode("officer");
@@ -1659,7 +1799,21 @@ export default function App() {
     <div style={{ fontFamily: FONT_BODY }}>
       <GlobalStyle />
 
-      {view === "landing" && <ModeSelect onSelect={(m) => m === "farmer" ? handleFarmer() : handleOfficer()} />}
+      {view === "landing" && (
+  <ModeSelect
+    onSelect={(m) =>
+      m === "farmer"
+        ? handleFarmer()
+        : setView("officerLogin")
+    }
+  />
+)}
+{view === "officerLogin" && (
+  <OfficerLogin
+    onBack={goLanding}
+    onLogin={handleOfficer}
+  />
+)}
 
       {view === "farmerHome" && mode === "farmer" && (
         <FarmerHome
@@ -1679,6 +1833,7 @@ export default function App() {
         <FarmerUpload
           lang={lang}
           setLang={setLang}
+          farmerId={farmerId}
           onBack={() => setView("farmerHome")}
           onSubmitted={handleFarmerSubmitted}
         />
@@ -1729,5 +1884,5 @@ export default function App() {
         />
       )}
     </div>
-  );
-}
+    );
+  }
